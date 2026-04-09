@@ -1,4 +1,5 @@
 mod semaphore;
+mod variant;
 
 
 use std::os::windows::ffi::OsStrExt;
@@ -11,13 +12,14 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::UpdateAgent::{
-    ISearchCompletedCallback, ISearchCompletedCallbackArgs, ISearchCompletedCallback_Impl,
+    ISearchCompletedCallback, ISearchCompletedCallback_Impl, ISearchCompletedCallbackArgs,
     ISearchJob, IUpdateServiceManager, IUpdateServiceManager2, IUpdateSession,
-    asfAllowOnlineRegistration, asfAllowPendingRegistration, asfRegisterServiceWithAU,
+    asfAllowOnlineRegistration, asfAllowPendingRegistration, asfRegisterServiceWithAU, orcSucceeded,
     ssManagedServer, ssOthers, ssWindowsUpdate,
 };
 
 use crate::semaphore::Semaphore;
+use crate::variant::null_variant;
 
 
 const MS_UPDATE_ID: &str = "7971f918-a847-4430-9279-4a52d1efe18d";
@@ -173,13 +175,30 @@ fn main() {
         continuation: Arc::clone(&continuation_semaphore),
     }.into_outer();
     let done_searching_unkn = done_searching.as_interface_ref();
-    let result = unsafe {
+    let search_job = unsafe {
         update_searcher.BeginSearch(
             &criteria,
             done_searching_unkn,
-            todo!("None-but-VARIANT"),
+            &null_variant(),
         )
-    };
+    }
+        .expect("failed to start search");
+
+    println!("search started");
+    continuation_semaphore.decrement_blocking();
+
+    let search_results = unsafe {
+        update_searcher.EndSearch(&search_job)
+    }
+        .expect("failed to obtain search results");
+    let result_code = unsafe {
+        search_results.ResultCode()
+    }
+        .expect("failed to obtain search operation result code");
+    if result_code != orcSucceeded {
+        println!("search operation result: {}", result_code.0);
+        todo!("do something");
+    }
 
     todo!();
 }
