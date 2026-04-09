@@ -1,8 +1,12 @@
+mod semaphore;
+
+
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
-use windows::core::{BSTR, Error, Ref, Interface, implement, w};
+use windows::core::{BSTR, ComObjectInterface, Error, Ref, Interface, implement, w};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
@@ -12,6 +16,8 @@ use windows::Win32::System::UpdateAgent::{
     asfAllowOnlineRegistration, asfAllowPendingRegistration, asfRegisterServiceWithAU,
     ssManagedServer, ssOthers, ssWindowsUpdate,
 };
+
+use crate::semaphore::Semaphore;
 
 
 const MS_UPDATE_ID: &str = "7971f918-a847-4430-9279-4a52d1efe18d";
@@ -36,14 +42,19 @@ struct Opts {
 }
 
 #[implement(ISearchCompletedCallback)]
-struct DoneSearching;
+struct DoneSearching {
+    continuation: Arc<Semaphore>,
+}
+#[allow(non_snake_case)]
 impl ISearchCompletedCallback_Impl for DoneSearching_Impl {
     fn Invoke(
         &self,
         search_job: Ref<ISearchJob>,
         callback_args: Ref<ISearchCompletedCallbackArgs>,
     ) -> Result<(), Error> {
-        todo!()
+        let _ = (search_job, callback_args);
+        self.continuation.increment();
+        Ok(())
     }
 }
 
@@ -157,12 +168,18 @@ fn main() {
         BSTR::from("IsInstalled = 0 AND Type = 'Software' AND IsHidden = 0")
     };
 
+    let continuation_semaphore = Arc::new(Semaphore::new(0));
+    let done_searching = DoneSearching {
+        continuation: Arc::clone(&continuation_semaphore),
+    }.into_outer();
+    let done_searching_unkn = done_searching.as_interface_ref();
+    let result = unsafe {
+        update_searcher.BeginSearch(
+            &criteria,
+            done_searching_unkn,
+            todo!("None-but-VARIANT"),
+        )
+    };
+
     todo!();
-    /*
-    update_searcher.BeginSearch(
-        &criteria,
-        oncompleted,
-        state,
-    )
-    */
 }
