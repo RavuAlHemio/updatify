@@ -177,46 +177,42 @@ fn main() -> ExitCode {
         CLSIDFromProgID(w!("Microsoft.Update.ServiceManager"))
     }
         .expect("failed to find class Microsoft.Update.ServiceManager");
+    let update_service_manager: IUpdateServiceManager = unsafe {
+        CoCreateInstance(
+            &update_service_manager_guid,
+            None,
+            CLSCTX_ALL,
+        )
+    }
+        .expect("failed to create update service manager");
 
     let mut offline_service_opt = None;
-    if opts.local.is_some() || opts.ms_update_opt_in {
-        // we will need an update service manager
-        let update_service_manager: IUpdateServiceManager = unsafe {
-            CoCreateInstance(
-                &update_service_manager_guid,
-                None,
-                CLSCTX_ALL,
+    if opts.ms_update_opt_in {
+        let manager2: IUpdateServiceManager2 = update_service_manager.cast()
+            .expect("failed to cast IUpdateServiceManager to IUpdateServiceManager2");
+        unsafe {
+            manager2.AddService2(
+                &BSTR::from(MS_UPDATE_ID),
+                asfAllowOnlineRegistration.0
+                    | asfAllowPendingRegistration.0
+                    | asfRegisterServiceWithAU.0,
+                &BSTR::from(""),
             )
         }
-            .expect("failed to create update service manager");
+            .expect("failed to register with Microsoft Update");
+    }
 
-        if opts.ms_update_opt_in {
-            let manager2: IUpdateServiceManager2 = update_service_manager.cast()
-                .expect("failed to cast IUpdateServiceManager to IUpdateServiceManager2");
-            unsafe {
-                manager2.AddService2(
-                    &BSTR::from(MS_UPDATE_ID),
-                    asfAllowOnlineRegistration.0
-                        | asfAllowPendingRegistration.0
-                        | asfRegisterServiceWithAU.0,
-                    &BSTR::from(""),
-                )
-            }
-                .expect("failed to register with Microsoft Update");
+    if let Some(loc) = opts.local {
+        let loc_u16: Vec<u16> = loc.as_os_str().encode_wide().collect();
+        let offline_service = unsafe {
+            update_service_manager.AddScanPackageService(
+                &BSTR::from("Offline Sync Service"),
+                &BSTR::from_wide(&loc_u16),
+                0,
+            )
         }
-
-        if let Some(loc) = opts.local {
-            let loc_u16: Vec<u16> = loc.as_os_str().encode_wide().collect();
-            let offline_service = unsafe {
-                update_service_manager.AddScanPackageService(
-                    &BSTR::from("Offline Sync Service"),
-                    &BSTR::from_wide(&loc_u16),
-                    0,
-                )
-            }
-                .expect("failed to add offline .cab for scanning");
-            offline_service_opt = Some(offline_service);
-        }
+            .expect("failed to add offline .cab for scanning");
+        offline_service_opt = Some(offline_service);
     }
 
     // create an update session
@@ -257,10 +253,35 @@ fn main() -> ExitCode {
         }
             .expect("failed to set service selection to WindowsUpdate to skip WSUS");
     } else {
-        unsafe {
-            update_searcher.SetServerSelection(ssManagedServer)
+        // WSUS if we have one, Windows Update if not
+        let mut have_wsus = false;
+        let service_collection = unsafe {
+            update_service_manager.Services()
         }
-            .expect("failed to set service selection to WSUS");
+            .expect("failed to obtain existing update services");
+        let service_count = unsafe {
+            service_collection.Count()
+        }
+            .expect("failed to obtain number of existing update services");
+        for i in 0..service_count {
+            let service = unsafe {
+                service_collection.get_Item(i)
+            }
+                .expect("failed to obtain update service");
+            let is_managed = unsafe {
+                service.IsManaged()
+            }
+                .expect("failed to obtain whether the service is managed");
+            if is_managed.as_bool() {
+                have_wsus = true;
+                break;
+            }
+        }
+
+        unsafe {
+            update_searcher.SetServerSelection(if have_wsus { ssManagedServer } else { ssWindowsUpdate })
+        }
+            .expect("failed to set service selection to WSUS/WU");
     }
 
     // search
