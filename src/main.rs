@@ -409,6 +409,34 @@ fn main() -> ExitCode {
                 }
             }
         }
+    } else {
+        // let fate decide -- alright
+
+        // take the first exclusive update if there is one
+        let mut exclusive_update_opt = None;
+        for update in &found_updates {
+            let behavior = unsafe {
+                update.InstallationBehavior()
+            }
+                .expect("failed to obtain installation behavior for update");
+            let impact = unsafe {
+                behavior.Impact()
+            }
+                .expect("failed to obtain update impact");
+            if impact == iiRequiresExclusiveHandling {
+                // yup, this is an exclusive one
+                exclusive_update_opt = Some(update);
+                break;
+            }
+        }
+
+        if let Some(exclusive_update) = exclusive_update_opt {
+            // choose only this one
+            chosen_updates.push(exclusive_update);
+        } else {
+            // throw all of them in
+            chosen_updates.extend(found_updates.iter());
+        }
     }
 
     if chosen_updates.len() == 0 {
@@ -440,7 +468,8 @@ fn main() -> ExitCode {
     let continuation = Arc::new(Semaphore::new(0));
     let download_state = DownloadState {
         continuation: Arc::clone(&continuation),
-    }.into_outer();
+    }
+        .into_outer();
     let downloader = unsafe {
         update_session.CreateUpdateDownloader()
     }
@@ -488,7 +517,8 @@ fn main() -> ExitCode {
     let continuation = Arc::new(Semaphore::new(0));
     let install_state = InstallState {
         continuation: Arc::clone(&continuation),
-    }.into_outer();
+    }
+        .into_outer();
     let installer = unsafe {
         update_session.CreateUpdateInstaller()
     }
