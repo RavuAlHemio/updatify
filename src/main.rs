@@ -7,20 +7,25 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::ptr::null_mut;
 use std::sync::Arc;
 
 use clap::Parser;
-use windows::core::{BSTR, ComObjectInterface, Error, Ref, Interface, implement, w};
+use windows::core::{BSTR, ComObjectInterface, Error, PCWSTR, Ref, Interface, implement, w};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
+use windows::Win32::System::Shutdown::InitiateSystemShutdownW;
 use windows::Win32::System::UpdateAgent::{
     IDownloadCompletedCallback, IDownloadCompletedCallback_Impl, IDownloadCompletedCallbackArgs,
     IDownloadJob, IDownloadProgressChangedCallback, IDownloadProgressChangedCallback_Impl,
-    IDownloadProgressChangedCallbackArgs, IUpdateCollection, IUpdateServiceManager,
+    IDownloadProgressChangedCallbackArgs, IInstallationCompletedCallback,
+    IInstallationCompletedCallback_Impl, IInstallationCompletedCallbackArgs, IInstallationJob,
+    IInstallationProgressChangedCallback, IInstallationProgressChangedCallback_Impl,
+    IInstallationProgressChangedCallbackArgs, IUpdateCollection, IUpdateServiceManager,
     IUpdateServiceManager2, IUpdateSession, InstallationImpact, InstallationRebootBehavior,
     OperationResultCode, asfAllowOnlineRegistration, asfAllowPendingRegistration,
-    asfRegisterServiceWithAU, iiMinor, iiNormal, iiRequiresExclusiveHandling, 
+    asfRegisterServiceWithAU, iiMinor, iiNormal, iiRequiresExclusiveHandling,
     irbAlwaysRequiresReboot, irbCanRequestReboot, irbNeverReboots, orcAborted, orcFailed,
     orcInProgress, orcNotStarted, orcSucceeded, orcSucceededWithErrors, ssManagedServer, ssOthers,
     ssWindowsUpdate,
@@ -48,6 +53,9 @@ struct Opts {
     pub interactive: bool,
 
     #[arg(long)]
+    pub reboot_when_done: bool,
+
+    #[arg(long)]
     pub criteria: Option<String>,
 }
 
@@ -67,7 +75,7 @@ impl IDownloadProgressChangedCallback_Impl for DownloadState_Impl {
         let progress = unsafe { callback_args.Progress() }?;
         let current_percent = unsafe { progress.CurrentUpdatePercentComplete() }?;
         let total_percent = unsafe { progress.PercentComplete() }?;
-        print!("\r{}% / {}%", current_percent, total_percent);
+        print!("\rdownload {:3}% / {:3}%", current_percent, total_percent);
         Ok(())
     }
 }
@@ -75,10 +83,43 @@ impl IDownloadProgressChangedCallback_Impl for DownloadState_Impl {
 impl IDownloadCompletedCallback_Impl for DownloadState_Impl {
     fn Invoke(
         &self,
-        search_job: Ref<IDownloadJob>,
-        callback_args: Ref<IDownloadCompletedCallbackArgs>,
+        download_job_ref: Ref<IDownloadJob>,
+        callback_args_ref: Ref<IDownloadCompletedCallbackArgs>,
     ) -> Result<(), Error> {
-        let _ = (search_job, callback_args);
+        let _ = (download_job_ref, callback_args_ref);
+        self.continuation.increment();
+        Ok(())
+    }
+}
+
+#[implement(IInstallationProgressChangedCallback, IInstallationCompletedCallback)]
+struct InstallState {
+    continuation: Arc<Semaphore>,
+}
+#[allow(non_snake_case)]
+impl IInstallationProgressChangedCallback_Impl for InstallState_Impl {
+    fn Invoke(
+        &self,
+        install_job_ref: Ref<IInstallationJob>,
+        callback_args_ref: Ref<IInstallationProgressChangedCallbackArgs>,
+    ) -> Result<(), Error> {
+        let _ = install_job_ref;
+        let callback_args = callback_args_ref.ok()?;
+        let progress = unsafe { callback_args.Progress() }?;
+        let current_percent = unsafe { progress.CurrentUpdatePercentComplete() }?;
+        let total_percent = unsafe { progress.PercentComplete() }?;
+        print!("\rinstall  {:3}% / {:3}%", current_percent, total_percent);
+        Ok(())
+    }
+}
+#[allow(non_snake_case)]
+impl IInstallationCompletedCallback_Impl for InstallState_Impl {
+    fn Invoke(
+        &self,
+        install_job_ref: Ref<IInstallationJob>,
+        callback_args_ref: Ref<IInstallationCompletedCallbackArgs>,
+    ) -> Result<(), Error> {
+        let _ = (install_job_ref, callback_args_ref);
         self.continuation.increment();
         Ok(())
     }
@@ -408,7 +449,7 @@ fn main() -> ExitCode {
         downloader.SetUpdates(&shopping_cart)
     }
         .expect("failed to set updates on downloader");
-    unsafe {
+    let download_job = unsafe {
         downloader.BeginDownload(
             download_state.as_interface_ref(),
             download_state.as_interface_ref(),
@@ -420,7 +461,99 @@ fn main() -> ExitCode {
     // wait on the semaphore for it to finish
     continuation.decrement_blocking();
 
-    todo!("install updates");
+    println!("download done");
+
+    let download_result = unsafe {
+        downloader.EndDownload(&download_job)
+    }
+        .expect("failed to obtain download result");
+
+    let result_code = unsafe {
+        download_result.ResultCode()
+    }
+        .expect("failed to obtain download operation result code");
+    if result_code != orcSucceeded {
+        let result_string = result_code_string(result_code);
+        println!("download operation result: {}", result_string);
+        if result_code != orcSucceededWithErrors {
+            // give up immediately
+            return ExitCode::FAILURE;
+        } else {
+            // warn the user once we're through
+            exit_code = ExitCode::FAILURE;
+        }
+    }
+
+    // whatever was downloaded, install it
+    let continuation = Arc::new(Semaphore::new(0));
+    let install_state = InstallState {
+        continuation: Arc::clone(&continuation),
+    }.into_outer();
+    let installer = unsafe {
+        update_session.CreateUpdateInstaller()
+    }
+        .expect("failed to create update installer");
+    unsafe {
+        installer.SetUpdates(&shopping_cart)
+    }
+        .expect("failed to tell installer which updates to install");
+    let install_job = unsafe {
+        installer.BeginInstall(
+            install_state.as_interface_ref(),
+            install_state.as_interface_ref(),
+            &null_variant(),
+        )
+    }
+        .expect("failed to start installation");
+
+    // wait on the semaphore for it to finish
+    continuation.decrement_blocking();
+
+    println!("install done");
+
+    let install_result = unsafe {
+        installer.EndInstall(&install_job)
+    }
+        .expect("failed to obtain installation result");
+
+    let result_code = unsafe {
+        install_result.ResultCode()
+    }
+        .expect("failed to obtain installation operation result code");
+    if result_code != orcSucceeded {
+        let result_string = result_code_string(result_code);
+        println!("installation operation result: {}", result_string);
+        if result_code != orcSucceededWithErrors {
+            // give up immediately
+            return ExitCode::FAILURE;
+        } else {
+            // warn the user once we're through
+            exit_code = ExitCode::FAILURE;
+        }
+    }
+
+    let gotta_reboot = unsafe {
+        install_result.RebootRequired()
+    }
+        .expect("failed to obtain whether to reboot")
+        .as_bool();
+    if gotta_reboot {
+        if !opts.reboot_when_done {
+            println!("gotta reboot the system");
+        } else {
+            // alright then
+            unsafe {
+                InitiateSystemShutdownW(
+                    PCWSTR(null_mut()), // local machine
+                    PCWSTR(null_mut()), // no message
+                    0, // no countdown
+                    false, // don't force-close apps
+                    true, // reboot after shutdown
+                )
+                    .expect("failed to initiate reboot, you'll have to do it yourself");
+            }
+        }
+    }
 
     exit_code
 }
