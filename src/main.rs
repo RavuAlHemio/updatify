@@ -234,7 +234,9 @@ fn main() -> ExitCode {
         update_session.CreateUpdateSearcher()
     }
         .expect("failed to create update searcher");
-    if let Some(offline_service) = offline_service_opt {
+    // only take a reference
+    // (we can only afford dropping the offline service once installation is done)
+    if let Some(offline_service) = offline_service_opt.as_ref() {
         unsafe {
             update_searcher.SetServerSelection(ssOthers)
         }
