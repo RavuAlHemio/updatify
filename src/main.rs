@@ -2,8 +2,11 @@ mod semaphore;
 mod variant;
 
 
+use std::borrow::Cow;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -12,10 +15,15 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::UpdateAgent::{
-    ISearchCompletedCallback, ISearchCompletedCallback_Impl, ISearchCompletedCallbackArgs,
-    ISearchJob, IUpdateServiceManager, IUpdateServiceManager2, IUpdateSession,
-    asfAllowOnlineRegistration, asfAllowPendingRegistration, asfRegisterServiceWithAU, orcSucceeded,
-    ssManagedServer, ssOthers, ssWindowsUpdate,
+    IDownloadCompletedCallback, IDownloadCompletedCallback_Impl, IDownloadCompletedCallbackArgs,
+    IDownloadJob, IDownloadProgressChangedCallback, IDownloadProgressChangedCallback_Impl,
+    IDownloadProgressChangedCallbackArgs, IUpdateCollection, IUpdateServiceManager,
+    IUpdateServiceManager2, IUpdateSession, InstallationImpact, InstallationRebootBehavior,
+    OperationResultCode, asfAllowOnlineRegistration, asfAllowPendingRegistration,
+    asfRegisterServiceWithAU, iiMinor, iiNormal, iiRequiresExclusiveHandling, 
+    irbAlwaysRequiresReboot, irbCanRequestReboot, irbNeverReboots, orcAborted, orcFailed,
+    orcInProgress, orcNotStarted, orcSucceeded, orcSucceededWithErrors, ssManagedServer, ssOthers,
+    ssWindowsUpdate,
 };
 
 use crate::semaphore::Semaphore;
@@ -43,16 +51,32 @@ struct Opts {
     pub criteria: Option<String>,
 }
 
-#[implement(ISearchCompletedCallback)]
-struct DoneSearching {
+#[implement(IDownloadProgressChangedCallback, IDownloadCompletedCallback)]
+struct DownloadState {
     continuation: Arc<Semaphore>,
 }
 #[allow(non_snake_case)]
-impl ISearchCompletedCallback_Impl for DoneSearching_Impl {
+impl IDownloadProgressChangedCallback_Impl for DownloadState_Impl {
     fn Invoke(
         &self,
-        search_job: Ref<ISearchJob>,
-        callback_args: Ref<ISearchCompletedCallbackArgs>,
+        download_job_ref: Ref<IDownloadJob>,
+        callback_args_ref: Ref<IDownloadProgressChangedCallbackArgs>,
+    ) -> Result<(), Error> {
+        let _ = download_job_ref;
+        let callback_args = callback_args_ref.ok()?;
+        let progress = unsafe { callback_args.Progress() }?;
+        let current_percent = unsafe { progress.CurrentUpdatePercentComplete() }?;
+        let total_percent = unsafe { progress.PercentComplete() }?;
+        print!("\r{}% / {}%", current_percent, total_percent);
+        Ok(())
+    }
+}
+#[allow(non_snake_case)]
+impl IDownloadCompletedCallback_Impl for DownloadState_Impl {
+    fn Invoke(
+        &self,
+        search_job: Ref<IDownloadJob>,
+        callback_args: Ref<IDownloadCompletedCallbackArgs>,
     ) -> Result<(), Error> {
         let _ = (search_job, callback_args);
         self.continuation.increment();
@@ -61,8 +85,43 @@ impl ISearchCompletedCallback_Impl for DoneSearching_Impl {
 }
 
 
-fn main() {
+#[allow(non_upper_case_globals)]
+fn result_code_string(result_code: OperationResultCode) -> Cow<'static, str> {
+    match result_code {
+        orcNotStarted => Cow::Borrowed("not started"),
+        orcInProgress => Cow::Borrowed("in progress"),
+        orcSucceeded => Cow::Borrowed("succeeded"),
+        orcSucceededWithErrors => Cow::Borrowed("succeeded with errors"),
+        orcFailed => Cow::Borrowed("failed"),
+        orcAborted => Cow::Borrowed("aborted"),
+        other => Cow::Owned(format!("unknown status code {}", other.0)),
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn minor_tag(impact: InstallationImpact) -> Cow<'static, str> {
+    match impact {
+        iiNormal => Cow::Borrowed(""),
+        iiMinor => Cow::Borrowed(" [minor]"),
+        iiRequiresExclusiveHandling => Cow::Borrowed(" [exclusive]"),
+        other => Cow::Owned(format!(" [impact {}]", other.0)),
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn reboot_tag(reboot_behavior: InstallationRebootBehavior) -> Cow<'static, str> {
+    match reboot_behavior {
+        irbNeverReboots => Cow::Borrowed(" [bootless]"),
+        irbAlwaysRequiresReboot => Cow::Borrowed(""),
+        irbCanRequestReboot => Cow::Borrowed("[mayboot]"),
+        other => Cow::Owned(format!("[reboot {}]", other.0)),
+    }
+}
+
+
+fn main() -> ExitCode {
     let opts = Opts::parse();
+    let mut exit_code = ExitCode::SUCCESS;
 
     // initialize COM
     unsafe {
@@ -169,36 +228,199 @@ fn main() {
     } else {
         BSTR::from("IsInstalled = 0 AND Type = 'Software' AND IsHidden = 0")
     };
-
-    let continuation_semaphore = Arc::new(Semaphore::new(0));
-    let done_searching = DoneSearching {
-        continuation: Arc::clone(&continuation_semaphore),
-    }.into_outer();
-    let done_searching_unkn = done_searching.as_interface_ref();
-    let search_job = unsafe {
-        update_searcher.BeginSearch(
+    println!("searching...");
+    let search_results = unsafe {
+        update_searcher.Search(
             &criteria,
-            done_searching_unkn,
-            &null_variant(),
         )
     }
-        .expect("failed to start search");
+        .expect("failed to perform search");
 
-    println!("search started");
-    continuation_semaphore.decrement_blocking();
-
-    let search_results = unsafe {
-        update_searcher.EndSearch(&search_job)
-    }
-        .expect("failed to obtain search results");
     let result_code = unsafe {
         search_results.ResultCode()
     }
         .expect("failed to obtain search operation result code");
     if result_code != orcSucceeded {
-        println!("search operation result: {}", result_code.0);
-        todo!("do something");
+        let result_string = result_code_string(result_code);
+        println!("search operation result: {}", result_string);
+        if result_code != orcSucceededWithErrors {
+            // give up immediately
+            return ExitCode::FAILURE;
+        } else {
+            // warn the user once we're through
+            exit_code = ExitCode::FAILURE;
+        }
     }
 
-    todo!();
+    let found_updates_com = unsafe {
+        search_results.Updates()
+    }
+        .expect("failed to obtain found updates");
+    let found_updates_count = unsafe {
+        found_updates_com.Count()
+    }
+        .expect("failed to obtain number of found updates");
+    let found_updates_len: usize = found_updates_count
+        .try_into().expect("failed to convert number of found updates");
+    let mut found_updates = Vec::with_capacity(found_updates_len);
+    for i in 0..found_updates_count {
+        let this_update = unsafe {
+            found_updates_com.get_Item(i)
+        }
+            .expect("failed to obtain update from search results");
+        found_updates.push(this_update);
+    }
+
+    if found_updates.len() == 0 {
+        println!("No updates found.");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut chosen_updates = Vec::new();
+    if opts.interactive {
+        for (i, update) in found_updates.iter().enumerate() {
+            let name: String = unsafe {
+                update.Title()
+            }
+                .expect("failed to obtain update name")
+                .try_into().expect("update name is invalid UTF-16");
+            let behavior = unsafe {
+                update.InstallationBehavior()
+            }
+                .expect("failed to obtain installation behavior of update");
+            let impact = unsafe {
+                behavior.Impact()
+            }
+                .expect("failed to obtain installation impact of update");
+            let reboot = unsafe {
+                behavior.RebootBehavior()
+            }
+                .expect("failedt to obtain reboot behavior of update");
+
+            println!("{}: {}{}{}", i, name, minor_tag(impact), reboot_tag(reboot));
+        }
+
+        let mut input = String::new();
+        loop {
+            chosen_updates.clear();
+            input.clear();
+
+            print!("Which updates would you like? (e.g. 1-3,5,7-12) ");
+            std::io::stdout().flush()
+                .expect("failed to flush stderr");
+
+            std::io::stdin().read_line(&mut input)
+                .expect("failed to read line");
+
+            // get ranges by splitting on commas
+            for range_str in input.split(',') {
+                // get range limits by splitting once on hyphen
+                if let Some((first_str, last_str)) = range_str.split_once('-') {
+                    // trim whitespace
+                    let first_str_no_ws = first_str.trim();
+                    let last_str_no_ws = last_str.trim();
+
+                    let invalid_char =
+                        first_str_no_ws.chars().any(|c| c <= '0' || c >= '9')
+                        || last_str_no_ws.chars().any(|c| c <= '0' || c >= '9')
+                    ;
+                    if invalid_char {
+                        println!("range {:?} contains an invalid char (expected '0' through '9' and maximum one '-')", range_str);
+                        continue;
+                    }
+                    let Ok(first): Result<usize, _> = first_str_no_ws.parse() else {
+                        println!("invalid lower bound {:?}", first_str_no_ws);
+                        continue;
+                    };
+                    let Ok(last): Result<usize, _> = last_str_no_ws.parse() else {
+                        println!("invalid upper bound {:?}", last_str_no_ws);
+                        continue;
+                    };
+
+                    if first > last {
+                        println!("first {} must be less than last {}", first, last);
+                        continue;
+                    }
+                    if first >= found_updates.len() || last >= found_updates.len() {
+                        println!("range {}-{} not valid, we only have updates 0-{}", first, last, found_updates.len()-1);
+                        continue;
+                    }
+
+                    for i in first..=last {
+                        chosen_updates.push(&found_updates[i]);
+                    }
+                } else {
+                    // no hyphen; assume a singular index
+                    let str_no_ws = range_str.trim();
+                    if str_no_ws.chars().any(|c| c <= '0' || c >= '9') {
+                        println!("index {:?} contains an invalid char (expected '0' through '9' and maximum one '-')", range_str);
+                        continue;
+                    }
+                    let Ok(index): Result<usize, _> = str_no_ws.parse() else {
+                        println!("invalid index {:?}", str_no_ws);
+                        continue;
+                    };
+                    if index >= found_updates.len() {
+                        println!("index {} not valid, we only have updates 0-{}", index, found_updates.len()-1);
+                        continue;
+                    }
+                    chosen_updates.push(&found_updates[index]);
+                }
+            }
+        }
+    }
+
+    if chosen_updates.len() == 0 {
+        println!("No updates chosen, downloading and installing no updates.");
+        return ExitCode::SUCCESS;
+    }
+
+    // fill up our shopping cart
+    let shopping_cart_guid = unsafe {
+        CLSIDFromProgID(w!("Microsoft.Update.UpdateColl"))
+    }
+        .expect("failed to find GUID for update collection class");
+    let shopping_cart: IUpdateCollection = unsafe {
+        CoCreateInstance(
+            &shopping_cart_guid,
+            None,
+            CLSCTX_ALL,
+        )
+    }
+        .expect("failed to create update collection");
+    for chosen_update in chosen_updates {
+        unsafe {
+            shopping_cart.Add(chosen_update)
+        }
+            .expect("failed to add chosen update to update collection");
+    }
+
+    // start downloading the updates
+    let continuation = Arc::new(Semaphore::new(0));
+    let download_state = DownloadState {
+        continuation: Arc::clone(&continuation),
+    }.into_outer();
+    let downloader = unsafe {
+        update_session.CreateUpdateDownloader()
+    }
+        .expect("failed to create update downloader");
+    unsafe {
+        downloader.SetUpdates(&shopping_cart)
+    }
+        .expect("failed to set updates on downloader");
+    unsafe {
+        downloader.BeginDownload(
+            download_state.as_interface_ref(),
+            download_state.as_interface_ref(),
+            &null_variant(),
+        )
+    }
+        .expect("failed to start update download");
+
+    // wait on the semaphore for it to finish
+    continuation.decrement_blocking();
+
+    todo!("install updates");
+
+    exit_code
 }
