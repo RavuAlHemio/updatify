@@ -518,6 +518,7 @@ fn main() -> ExitCode {
     // wait on the semaphore for it to finish
     continuation.decrement_blocking();
 
+    println!();
     println!("download done");
 
     let download_result = unsafe {
@@ -567,6 +568,7 @@ fn main() -> ExitCode {
     // wait on the semaphore for it to finish
     continuation.decrement_blocking();
 
+    println!();
     println!("install done");
 
     let install_result = unsafe {
