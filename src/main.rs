@@ -158,8 +158,8 @@ fn reboot_tag(reboot_behavior: InstallationRebootBehavior) -> Cow<'static, str> 
     match reboot_behavior {
         irbNeverReboots => Cow::Borrowed(" [bootless]"),
         irbAlwaysRequiresReboot => Cow::Borrowed(""),
-        irbCanRequestReboot => Cow::Borrowed("[mayboot]"),
-        other => Cow::Owned(format!("[reboot {}]", other.0)),
+        irbCanRequestReboot => Cow::Borrowed(" [mayboot]"),
+        other => Cow::Owned(format!(" [reboot {}]", other.0)),
     }
 }
 
