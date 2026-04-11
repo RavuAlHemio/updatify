@@ -344,30 +344,31 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // list updates
+    for (i, update) in found_updates.iter().enumerate() {
+        let name: String = unsafe {
+            update.Title()
+        }
+            .expect("failed to obtain update name")
+            .try_into().expect("update name is invalid UTF-16");
+        let behavior = unsafe {
+            update.InstallationBehavior()
+        }
+            .expect("failed to obtain installation behavior of update");
+        let impact = unsafe {
+            behavior.Impact()
+        }
+            .expect("failed to obtain installation impact of update");
+        let reboot = unsafe {
+            behavior.RebootBehavior()
+        }
+            .expect("failed to obtain reboot behavior of update");
+
+        println!("{}: {}{}{}", i, name, minor_tag(impact), reboot_tag(reboot));
+    }
+
     let mut chosen_updates = Vec::new();
     if opts.interactive {
-        for (i, update) in found_updates.iter().enumerate() {
-            let name: String = unsafe {
-                update.Title()
-            }
-                .expect("failed to obtain update name")
-                .try_into().expect("update name is invalid UTF-16");
-            let behavior = unsafe {
-                update.InstallationBehavior()
-            }
-                .expect("failed to obtain installation behavior of update");
-            let impact = unsafe {
-                behavior.Impact()
-            }
-                .expect("failed to obtain installation impact of update");
-            let reboot = unsafe {
-                behavior.RebootBehavior()
-            }
-                .expect("failedt to obtain reboot behavior of update");
-
-            println!("{}: {}{}{}", i, name, minor_tag(impact), reboot_tag(reboot));
-        }
-
         let mut input = String::new();
         loop {
             chosen_updates.clear();
