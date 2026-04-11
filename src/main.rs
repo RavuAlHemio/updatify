@@ -76,6 +76,8 @@ impl IDownloadProgressChangedCallback_Impl for DownloadState_Impl {
         let current_percent = unsafe { progress.CurrentUpdatePercentComplete() }?;
         let total_percent = unsafe { progress.PercentComplete() }?;
         print!("\rdownload {:3}% / {:3}%", current_percent, total_percent);
+        std::io::stdout().flush()
+            .expect("failed to flush stdout");
         Ok(())
     }
 }
@@ -109,6 +111,8 @@ impl IInstallationProgressChangedCallback_Impl for InstallState_Impl {
         let current_percent = unsafe { progress.CurrentUpdatePercentComplete() }?;
         let total_percent = unsafe { progress.PercentComplete() }?;
         print!("\rinstall  {:3}% / {:3}%", current_percent, total_percent);
+        std::io::stdout().flush()
+            .expect("failed to flush stdout");
         Ok(())
     }
 }
