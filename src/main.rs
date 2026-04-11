@@ -375,7 +375,7 @@ fn main() -> ExitCode {
 
             print!("Which updates would you like? (e.g. 1-3,5,7-12) ");
             std::io::stdout().flush()
-                .expect("failed to flush stderr");
+                .expect("failed to flush stdout");
 
             std::io::stdin().read_line(&mut input)
                 .expect("failed to read line");
